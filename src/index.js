@@ -1,4 +1,5 @@
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
+const ENCODER = new TextEncoder();
 
 function getReqRunBaseUrl(env) {
   return (env.REQRUN_BASE_URL || "https://api.reqrun.com").trim();
@@ -14,21 +15,63 @@ function getReqRunApiKey(env) {
   return apiKey;
 }
 
+function getReqRunSigningSecret(env) {
+  const signingSecret = (env.REQRUN_SIGNING_SECRET || "").trim();
+
+  if (!signingSecret) {
+    throw new Error("Missing REQRUN_SIGNING_SECRET. Copy .dev.vars.example to .dev.vars and add the signing secret shown when you created the key.");
+  }
+
+  return signingSecret;
+}
+
+function toHex(buffer) {
+  return Array.from(new Uint8Array(buffer), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Hex(value) {
+  return toHex(await crypto.subtle.digest("SHA-256", ENCODER.encode(value)));
+}
+
+async function hmacHex(secret, value) {
+  const key = await crypto.subtle.importKey("raw", ENCODER.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return toHex(await crypto.subtle.sign("HMAC", key, ENCODER.encode(value)));
+}
+
+async function getSignedReqRunHeaders(env, path, method, bodyString = "") {
+  const timestamp = new Date().toISOString();
+  const nonce = crypto.randomUUID().replace(/-/g, "");
+  const bodyHash = await sha256Hex(bodyString);
+  const signaturePayload = [method, path, timestamp, nonce, bodyHash].join("\n");
+  const signature = await hmacHex(getReqRunSigningSecret(env), signaturePayload);
+
+  return {
+    authorization: `Bearer ${getReqRunApiKey(env)}`,
+    "x-reqrun-timestamp": timestamp,
+    "x-reqrun-nonce": nonce,
+    "x-reqrun-signature": `v1=${signature}`,
+  };
+}
+
 async function forwardToReqRun(env, payload) {
-  return fetch(`${getReqRunBaseUrl(env)}/v1/chat/completions`, {
+  const path = "/v1/chat/completions";
+  const bodyString = JSON.stringify(payload);
+
+  return fetch(`${getReqRunBaseUrl(env)}${path}`, {
     method: "POST",
     headers: {
       ...JSON_HEADERS,
-      authorization: `Bearer ${getReqRunApiKey(env)}`,
+      ...(await getSignedReqRunHeaders(env, path, "POST", bodyString)),
     },
-    body: JSON.stringify(payload),
+    body: bodyString,
   });
 }
 
 async function getReqRunStatus(env, requestId) {
-  return fetch(`${getReqRunBaseUrl(env)}/v1/requests/${requestId}`, {
+  const path = `/v1/requests/${requestId}`;
+  return fetch(`${getReqRunBaseUrl(env)}${path}`, {
     headers: {
-      authorization: `Bearer ${getReqRunApiKey(env)}`,
+      ...(await getSignedReqRunHeaders(env, path, "GET")),
     },
   });
 }
